@@ -3,7 +3,8 @@ import 'dart:io';
 
 import 'package:analyzer/dart/element/element.dart';
 import 'package:build/build.dart';
-import 'package:path/path.dart' as path;
+import 'package:collection/collection.dart';
+import 'package:path/path.dart' as p;
 import 'package:source_gen/source_gen.dart';
 import 'package:widgetbook_annotation/widgetbook_annotation.dart';
 import 'package:yaml/yaml.dart';
@@ -15,12 +16,21 @@ import '../models/use_case_metadata.dart';
 class UseCaseGenerator extends GeneratorForAnnotation<UseCase> {
   UseCaseGenerator(this.navPathMode);
 
-  final packagesMapResource = Resource<YamlMap>(
+  final localPackages = Resource<Map<String, String>>(
     () async {
       final lockFile = await File('pubspec.lock').readAsString();
       final yaml = loadYaml(lockFile) as YamlMap;
+      final packages = yaml['packages'] as YamlMap;
+      final localEntries = packages.entries
+          .where((entry) => entry.value['source'] == 'path')
+          .map(
+            (entry) => MapEntry(
+              entry.key as String,
+              entry.value['description']['path'] as String,
+            ),
+          );
 
-      return yaml['packages'] as YamlMap;
+      return Map.fromEntries(localEntries);
     },
   );
 
@@ -61,8 +71,8 @@ class UseCaseGenerator extends GeneratorForAnnotation<UseCase> {
         // if no type parameter is specified.
         .replaceAll('<dynamic>', '');
 
-    final useCaseUri = resolveElementUri(element);
-    final componentUri = resolveElementUri(type.element!);
+    final useCaseUri = await resolveElementUri(element, buildStep);
+    final componentUri = await resolveElementUri(type.element!, buildStep);
 
     final useCasePath = await resolveElementPath(element, buildStep);
     final componentPath = await resolveElementPath(type.element!, buildStep);
@@ -71,7 +81,8 @@ class UseCaseGenerator extends GeneratorForAnnotation<UseCase> {
         ? componentUri
         : useCaseUri;
 
-    final navPath = path ?? getNavPath(targetNavUri);
+    final inputPackage = buildStep.inputId.package;
+    final navPath = path ?? getNavPath(targetNavUri, inputPackage);
 
     final metadata = UseCaseMetadata(
       functionName: element.name!,
@@ -94,22 +105,83 @@ class UseCaseGenerator extends GeneratorForAnnotation<UseCase> {
 
   /// Splits the [uri] into its parts, skipping both the `package:` and
   /// the `src` parts.
-  ///
   /// For example, `package:widgetbook/src/widgets/foo/bar.dart`
   /// will be split into `['widgets', 'foo']`.
-  static String getNavPath(String uri) {
-    final directory = path.dirname(uri);
-    final parts = path.split(directory);
+  ///
+  /// If generator is running on a sub-package in a monorepo, the package name
+  /// will be prepended. The package is considered a sub-package if the
+  /// package name in the URI is different from the input package.
+  /// For example, `package:main_app/src/widgets/foo/bar.dart` in a package
+  /// named `workspace` will be split into `['main_app', 'widgets', 'foo']`.
+  static String getNavPath(
+    String uri,
+    String inputPackage,
+  ) {
+    final directory = p.dirname(uri);
+    final parts = p.split(directory);
     final hasSrc = parts.length >= 2 && parts[1] == 'src';
 
-    return parts.skip(hasSrc ? 2 : 1).join('/');
+    final navPath = parts.skip(hasSrc ? 2 : 1).join('/');
+    final uriPackage = parts.first.replaceFirst('package:', '');
+    final isSamePackage = uriPackage == inputPackage;
+
+    return isSamePackage ? navPath : '$uriPackage/$navPath';
   }
 
   /// Resolves the URI of an [element] by retrieving the URI from
   /// the [element]'s source.
-  String resolveElementUri(Element element) {
+  Future<String> resolveElementUri(
+    Element element,
+    BuildStep buildStep,
+  ) async {
     final source = element.librarySource ?? element.source!;
-    return source.uri.toString();
+    final uri = source.uri;
+    final rawUri = uri.toString();
+
+    if (uri.scheme == 'package') return rawUri;
+
+    final resource = await buildStep.fetchResource(localPackages);
+
+    // If the URI is an asset URI, means the input file is located outside
+    // the input package's lib folder. In this case, we try to promote the
+    // asset URI to a package URI.
+    return tryPromoteAssetUri(uri, resource) ?? rawUri;
+  }
+
+  /// An asset URI can be promoted to a package URI if
+  /// it has the following two conditions:
+  /// 1. The [uri] matches the pattern:
+  ///    `asset:{input_package}/{local_package_path}/lib/...`.
+  /// 2. There's a package defined in `pubspec.lock` that has a path
+  ///    that matches the `{local_package_path}`.
+  ///
+  /// If both conditions are met, the URI will be promoted to a package URI.
+  /// The URI will be changed from `asset:.../{local_package_patch}/lib/...`
+  /// to `package:{local_package}/...`.
+  ///
+  /// Returns the promoted URI if the conditions are met,
+  /// otherwise returns `null`.
+  String? tryPromoteAssetUri(
+    Uri uri,
+    Map<String, String> localPackages,
+  ) {
+    final rawUri = uri.toString();
+    final regex = RegExp(r'asset:([^/]+)/(.*)/lib/(.*)');
+    final match = regex.firstMatch(rawUri);
+
+    if (match == null) return null;
+
+    final localPackagePath = match.group(2);
+    final localPackage = localPackages.entries.firstWhereOrNull(
+      (entry) => entry.value == localPackagePath,
+    );
+
+    if (localPackage == null) return null;
+
+    final packageName = localPackage.key;
+    final filePath = match.group(3);
+
+    return 'package:$packageName/$filePath';
   }
 
   /// Resolves the path of a local package by retrieving the path from
@@ -137,7 +209,7 @@ class UseCaseGenerator extends GeneratorForAnnotation<UseCase> {
     // current directory name.
     if (elementPackage == inputPackage) {
       final currentDir = Directory.current.path;
-      final dirName = path.basename(currentDir);
+      final dirName = p.basename(currentDir);
 
       return elementPath.replaceFirst(
         RegExp(elementPackage),
@@ -145,21 +217,20 @@ class UseCaseGenerator extends GeneratorForAnnotation<UseCase> {
       );
     }
 
-    final resource = await buildStep.fetchResource(packagesMapResource);
-    final packageData = resource[elementPackage] as YamlMap;
-    final isLocalPackage = packageData['source'] == 'path';
+    final resource = await buildStep.fetchResource(localPackages);
+    final packagePath = resource[elementPackage];
+    final isLocalPackage = packagePath != null;
 
     if (!isLocalPackage) return elementPath;
 
-    final packagePath = packageData['description']['path'] as String;
-    final normalizedPackagePath = packagePath.replaceAll(
+    final normalizedPath = packagePath.replaceAll(
       RegExp(r'(\.)?\.\/'), // Match "./" and "../"
       '',
     );
 
     return elementPath.replaceFirst(
       RegExp(elementPackage),
-      normalizedPackagePath,
+      normalizedPath,
     );
   }
 }
